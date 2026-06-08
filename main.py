@@ -31,7 +31,6 @@ from experiment_logger_100runs import  write_detailed_mcf_run_log_json
 from controller_selection_module import get_min_controllers_and_assignment
 
 # Routing / Path
-from path_MCF_routing import choose_single_kpath_for_assignment
 from arc_MCF_routing import solve_binary_mcf_routing_and_init_rt
 
 # Optimizers
