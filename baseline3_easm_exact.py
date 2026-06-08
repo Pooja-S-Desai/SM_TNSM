@@ -1,6 +1,6 @@
-# baseline3_easm_exact.py
+# baseline2_easm_exact.py
 # ------------------------------------------------------------
-# Baseline-3: EASM exact algorithm-structure implementation
+# Baseline-2: EASM exact algorithm-structure implementation
 # Paper: "EASM: Efficiency-aware switch migration for balancing
 # controller loads in software-defined networking"
 #
