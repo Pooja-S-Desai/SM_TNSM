@@ -1,0 +1,5 @@
+topology,run,algo,phase,controller,lambda,mu_init,mu_final,scale_factor,rho_init,rho_final,W_init,W_final,stable,alpha,beta,link_sens,k_paths,load_sens,controller_sens
+Xspedius,0,B1,SM,1,966.0,1856.0,1856.0,1.0,0.5205,0.5205,0.1203,1.1236,1,0.5,0.5,0.1,5,0.0,0.0
+Xspedius,0,B1,SM,2,1472.0,1855.2,1855.2,1.0,0.7934,0.7934,0.3262,2.6096,1,0.5,0.5,0.1,5,0.0,0.0
+Xspedius,0,B1,SM,3,1857.0,1862.4,1862.4,1.0,0.9971,0.9971,inf,185.1852,1,0.5,0.5,0.1,5,0.0,0.0
+Xspedius,0,B1,SM,4,1727.0,1743.2,1743.2,1.0,0.9907,0.9907,inf,61.7284,1,0.5,0.5,0.1,5,0.0,0.0

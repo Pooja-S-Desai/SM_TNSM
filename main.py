@@ -1,7 +1,7 @@
 # main.py
 from __future__ import annotations
 import shutil
-from baseline2_EASM import run_baseline2_easm_exact
+
 # =============================
 # Standard Library
 # =============================
@@ -38,7 +38,7 @@ from switch_migration_optimizer_shortest import run_migration_optimizer
 
 # Baselines / Variants
 from baseline1_paper_milp import run_baseline1_paper_milp
-
+from baseline2_EASM import run_baseline2_easm_exact
 # Steiner / Sync
 from steiner_opt import run_steiner_constant_penalty
 
@@ -177,7 +177,6 @@ def _assert_dict(name, obj):
 
 RUN_BASELINE1 = True   # set False to skip
 RUN_BASELINE2 = True
-RUN_BASELINE3 = True
 # =========================================================================================================================================
 # Main Function
 # =========================================================================================================================================
@@ -1078,8 +1077,8 @@ def main():
                             except nx.NetworkXNoPath:
                                 dij_hop[(s, c)] = float("inf")
         
-                    if RUN_BASELINE3:
-                        print(f"🚀 ENTERING BASELINE3 EASM | run={RUN_INDEX}")
+                    if RUN_BASELINE2:
+                        print(f"🚀 ENTERING BASELINE2 EASM | run={RUN_INDEX}")
 
                         solve_start = time.perf_counter()
 
@@ -1094,7 +1093,7 @@ def main():
                             mip_easm,
                             status_easm,
                             meta_easm,
-                        ) = run_baseline3_easm_exact(
+                        ) = run_baseline2_easm_exact(
                             G=G_run,
                             switches=switches,
                             controllers=controllers,
