@@ -15,9 +15,11 @@ from helpers import (
     FIBER_SEC_PER_KM,
     TIME_LIMIT as time_limit
 )
+from experiment_logger_100runs import  _write_resilience_debug_log
 from rt_metrics import build_paths_sc_from_switch_paths
-
+from plotting import plot_final_vs_recovery_assignment
 from rt_metrics import flows_to_usage_and_rtt
+from collections import defaultdict
 def _compute_usage_from_solution(f, commodity_pairs, arcs, edge_caps_e):
     """
     Uses solved f[...] (tupledict of gurobi vars) to compute undirected per-link usage.
@@ -135,17 +137,17 @@ def run_migration_optimizer_integrated_mcf_arc(
     capacities,
     init_assign,
     *,
-    objective_type: str = "min_dev",     # one of: maxmin, min_max_util, min_sum_util, min_dev, variance
+    objective_type: str = "maxmin",     # one of: maxmin, min_max_util, min_sum_util, min_dev, variance
     topology_name: str | None = None,
 
     # RT knobs (already in your arc-based file)
     round_trip: bool = True,
-    rho_max: float = 0.95,
+    rho_max: float = 0.99,
     pwl_segments: int = 12,
 
     # Practical anti-cycle regularizer (recommended small positive like 1e-12..1e-8)
     eta: float = 0.0,
-    rho_max_local=0.95,  
+    rho_max_local=0.99,  
     # Migration-cost inputs
     Dcc: dict | None = None,             # controller↔controller shortest path cost (you decide units)
     sync_per_ctrl_ms: float = 0.0,       # steiner sync penalty added to RT via controller (ms)
@@ -165,9 +167,20 @@ def run_migration_optimizer_integrated_mcf_arc(
 
 
 
-    allow_path_splitting=False,
+    allow_path_splitting=True,
     alpha:float,
-    beta:float 
+    beta:float,
+    gamma_res: float = 1.0 ,
+    run_index: int = 0,
+    resilience_log_dir: str | None = None,
+
+    # plotting from MCF-ARC only
+    plot_recovery: bool = False,
+    plot_pos: dict | None = None,
+    plot_save_dir: str | None = None,
+    plot_topology_name: str | None = None,
+    plot_file_tag: str | None = None,
+    node_capacities: dict | None = None,
 ):
     """
     Arc-based integrated assignment + MCF + RT variables.
@@ -176,7 +189,6 @@ def run_migration_optimizer_integrated_mcf_arc(
       (#migrations) + (C-C transfer gated by migration) + ΔmeanRT_pos.
 
     NOTE:
-    - No DAG/acyclic constraints are added (as requested).
     - If you want to discourage cycles, set eta > 0 (tiny).
     """
 
@@ -213,14 +225,14 @@ def run_migration_optimizer_integrated_mcf_arc(
     rtt_M = _max_shortest_rtt_bound(G, switches, controllers, round_trip=round_trip)
     mu_eff = {c: float(GLOBAL_THRESHOLD) * float(capacities[c]) for c in controllers}
 
-    # W max bound
-    Wmax_overall = 0.0
-    for c, muc in mu_eff.items():
-        if muc <= 0:
-            Wmax_overall = max(Wmax_overall, 1e6)
-        else:
-            eps = max(1e-9, 1.0 - float(rho_max))
-            Wmax_overall = max(Wmax_overall, 1.0 / (muc * eps))
+    # # W max bound
+    # Wmax_overall = 0.0
+    # for c, muc in mu_eff.items():
+    #     if muc <= 0:
+    #         Wmax_overall = max(Wmax_overall, 1e6)
+    #     else:
+    #         eps = max(1e-9, 1.0 - float(rho_max))
+    #         Wmax_overall = max(Wmax_overall, 1.0 / (muc * eps))
 
     # Steiner sync in seconds and ms
     S_ms = {c: float(sync_per_ctrl_ms) for c in controllers}
@@ -244,7 +256,7 @@ def run_migration_optimizer_integrated_mcf_arc(
     f = m.addVars([(s, c, u, v) for (s, c) in commodity_pairs for (u, v) in arcs],
                   lb=0.0, name="f")
 
-    # controller load and queue
+    # controller load and service dlay(queue+processing)standrad m/m/1 queuing used 1/(mu-lambda)
     lam = m.addVars(controllers, lb=0.0, name="lambda")   # req/s
     W_sec = m.addVars(controllers, lb=0.0, name="W_sec")  # seconds
 
@@ -263,11 +275,18 @@ def run_migration_optimizer_integrated_mcf_arc(
     b_used = m.addVars([(s, c, u, v) for (s, c) in commodity_pairs for (u, v) in arcs],
                     vtype=GRB.BINARY, name="b_used")
     # One-way propagation along the chosen path (seconds)
-    P_oneway_sec = m.addVars(commodity_pairs, lb=0.0, name="P_oneway_sec")
-
+    # P_oneway_sec = m.addVars(commodity_pairs, lb=0.0, name="P_oneway_sec")
+    ord_pos = m.addVars(
+        [(s, c, n) for (s, c) in commodity_pairs for n in G.nodes()],
+        lb=0.0,
+        ub=float(len(G.nodes())),
+        name="ord_pos"
+    )
     # pi[s,c,n] = potential/label (one-way propagation seconds) at node n for commodity (s,c)
     pi = m.addVars([(s, c, n) for (s, c) in commodity_pairs for n in UG.nodes()],
                 lb=0.0, name="pi")
+    N = len(G.nodes())
+
 
     # Pworst_oneway_sec[s,c] = worst one-way path propagation cost among used paths
     Pworst_oneway_sec = m.addVars(commodity_pairs, lb=0.0, name="Pworst_oneway_sec")
@@ -341,7 +360,7 @@ def run_migration_optimizer_integrated_mcf_arc(
                 m.addConstr(f[s, c, u, v] <= d_bits * b_used[s, c, u, v],
                             name=f"f_le_dbUsed_{s}_{c}_{u}_{v}")
 
-                # if b_used=1 => enforce tiny positive flow to keep b_used realistic
+                # if b_used=1 => enforce tiny positive flow to keep b_used honest
                 m.addConstr(f[s, c, u, v] >= EPS_FLOW * b_used[s, c, u, v],
                             name=f"f_ge_epsbUsed_{s}_{c}_{u}_{v}")
 
@@ -403,22 +422,63 @@ def run_migration_optimizer_integrated_mcf_arc(
                     m.addConstr(outb <= 1,  name=f"b_outdeg1_{s}_{c}_{n}")
                     m.addConstr(inb  <= 1,  name=f"b_indeg1_{s}_{c}_{n}")
 
+    # ============================================================
+    # (6a) Cycle elimination for b_used
+    # ============================================================
+    N = len(G.nodes())
 
-    # # (6b) potentials define WORST used path cost (max over used paths) and avoid cycles
-    # # pi[s,c,s] = 0
-    # # if arc (u,v) is used then pi[v] >= pi[u] + delay(u,v)
-    # # worst one-way path cost is pi at sink: Pworst_oneway_sec[s,c] = pi[s,c,c]
-    # for (s, c) in commodity_pairs:
-    #     m.addConstr(pi[s, c, s] == 0.0, name=f"pi_src_{s}_{c}")
+    for (s, c) in commodity_pairs:
+        m.addConstr(ord_pos[s, c, s] == 0.0, name=f"ord_src_{s}_{c}")
 
-    #     for (u, v) in arcs:
-    #         m.addConstr(
-    #             pi[s, c, v] >= pi[s, c, u] + arc_delay_sec[(u, v)] - BIGM_PI * (1 - b_used[s, c, u, v]),
-    #             name=f"pi_inc_{s}_{c}_{u}_{v}"
-    #         )
+        for (u, v) in arcs:
+            m.addConstr(
+                ord_pos[s, c, v]
+                >= ord_pos[s, c, u] + 1
+                - N * (1 - b_used[s, c, u, v]),
+                name=f"cycle_elim_{s}_{c}_{u}_{v}"
+            )
 
-    #     m.addConstr(Pworst_oneway_sec[s, c] == pi[s, c, c], name=f"Pworst_def_{s}_{c}")
 
+    # ============================================================
+    # (6b) WORST USED PATH DELAY using node potentials
+    # ============================================================
+    # pi[s,c,n] = accumulated propagation delay from source s to node n
+    # If arc (u,v) is used, then:
+    #     pi[v] >= pi[u] + delay(u,v)
+    #
+    # Therefore, pi at destination controller c becomes at least the
+    # delay of every used s->c path.
+    #
+    # If multiple paths are used, this gives the WORST / LONGEST used path.
+
+    for (s, c) in commodity_pairs:
+
+        # Source switch has zero accumulated delay
+        m.addConstr(
+            pi[s, c, s] == 0.0,
+            name=f"pi_src_{s}_{c}"
+        )
+
+        for (u, v) in arcs:
+
+            # If b_used[s,c,u,v] = 1:
+            #     pi[v] >= pi[u] + delay(u,v)
+            #       "To reach node v, first reach u, then traverse the link u→v."
+            # If b_used[s,c,u,v] = 0:
+            #     Big-M relaxes the constraint
+            m.addConstr(
+                pi[s, c, v]
+                >= pi[s, c, u]
+                + arc_delay_sec[(u, v)]
+                - BIGM_PI * (1 - b_used[s, c, u, v]),
+                name=f"pi_inc_{s}_{c}_{u}_{v}"
+            )
+
+        # Worst one-way delay is the potential at destination controller c
+        m.addConstr(
+            Pworst_oneway_sec[s, c] == pi[s, c, c],
+            name=f"Pworst_def_{s}_{c}"
+        )
 
 
     # (7) per-link bandwidth caps (undirected)
@@ -431,30 +491,44 @@ def run_migration_optimizer_integrated_mcf_arc(
 
     # (8) PWL for W_sec[c] ≈ 1/(μ-λ)
     for c in controllers:
-        muc = float(mu_eff[c])
+        muc = float(mu_eff[c]) 
+        # muc is effective usable controller service rate in req/s
         if muc <= 0.0:
             m.addConstr(W_sec[c] >= 1e6, name=f"W_dead_{c}")
             continue
 
+#       rho is lamda/mu(controller load/controller capacity) where rho is controller utilization.
         xs = [rho * muc for rho in (i * (float(rho_max) / pwl_segments) for i in range(pwl_segments + 1))]
+        #  for loop for loping untill pwl_segment+1 wherein for each i generate rho value in range of 0 to rho_max and then multiply with muc to get the lambda value for each segment.rho_max) / pwl_segments is ste size increment like i++
+        # generate pwl segemnts number eg 12 different values in range of max controller capacity where approximateion value nearby can be identified.
         ys = [1.0 / max(1e-9, muc - x) for x in xs]
+        # generating a PWL curve based on the xs and ys values where ys is 1/(mu-lambda) for each lambda value in xs. max(1e-9, muc - x) is used to avoid division by zero or negative values. also y is basically 1/(mu-lamda) which is basically the waiting time in seconds for each lambda value in xs.
         m.addGenConstrPWL(lam[c], W_sec[c], xs, ys, name=f"W_pwl_{c}")
+        # telling gurobi to use the PWL constraint for each controller c where lam[c] is the lambda value and W_sec[c] is the waiting time in seconds. xs and ys are the x and y values for the PWL curve. name is just a name for the constraint.  
 
-    # (9) Exact RTT for UNSPLITTABLE: RTT_flow_sec[s,c] = rtfactor * sum(delay * b_used)
+    # --------------------------------------------------------
+    # 9) Compute the network propagation delay (RTT) for each
+    # switch-controller commodity.
+    #
+    # Pworst_oneway_sec already represents:
+    #   - the only selected path delay (unsplittable routing), or
+    #   - the longest/worst used path delay (splittable routing).
+    #
+    # Therefore, the same RTT computation is valid for both routing modes.
+    #
+    # If round_trip=True:
+    #     RTT = 2 × one-way propagation delay.
+    #
+    # Otherwise:
+    #     RTT = one-way propagation delay.
+    # -----------------------------------------------
     for (s, c) in commodity_pairs:
         rtfactor = 2.0 if round_trip else 1.0
 
         m.addConstr(
-            P_oneway_sec[s, c] ==
-            gp.quicksum(arc_delay_sec[(u, v)] * b_used[s, c, u, v] for (u, v) in arcs),
-            name=f"P_oneway_def_{s}_{c}"
+            RTT_flow_sec[s, c] == rtfactor * Pworst_oneway_sec[s, c],
+            name=f"rtt_worst_path_{s}_{c}"
         )
-
-        m.addConstr(
-            RTT_flow_sec[s, c] == rtfactor * P_oneway_sec[s, c],
-            name=f"rtt_exact_{s}_{c}"
-        )
-
 
     # (10) Switch RT: T_sec[s] = RTT_flow_sec + W_sec[assigned] + Steiner_sec
     for s in switches:
